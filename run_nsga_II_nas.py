@@ -55,7 +55,7 @@ class NASBenchMultiObjective(ElementwiseProblem):
 if __name__ == "__main__":
     print("Chargement des bases de données...")
     # Remplace les chemins par les bons chemins absolus ou relatifs vers tes fichiers .pth et .pickle
-    api_201 = NASBench201API('NAS-Bench-201-v1_1-096897.pth') 
+    api_201 = NASBench201API('/content/drive/MyDrive/NAS-Bench-201-v1_1-096897.pth')
     api_hw = HWNASBenchAPI('./HW-NAS-Bench-v1_0.pickle', search_space='nasbench201')
     
     # Paramétrage : Choix du dataset et du hardware cible (ex: Edge GPU, Edge TPU, FPGA, etc.)
