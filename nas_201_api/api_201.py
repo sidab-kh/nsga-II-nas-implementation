@@ -67,7 +67,7 @@ class NASBench201API(NASBenchMetaAPI):
       if verbose: print('try to create the NAS-Bench-201 api from {:}'.format(file_path_or_dict))
       assert os.path.isfile(file_path_or_dict), 'invalid path : {:}'.format(file_path_or_dict)
       self.filename = Path(file_path_or_dict).name
-      file_path_or_dict = torch.load(file_path_or_dict, map_location='cpu')
+      file_path_or_dict = torch.load(file_path_or_dict, map_location='cpu', weights_only=False)
     elif isinstance(file_path_or_dict, dict):
       file_path_or_dict = copy.deepcopy(file_path_or_dict)
     else: raise ValueError('invalid type : {:} not in [str, dict]'.format(type(file_path_or_dict)))
