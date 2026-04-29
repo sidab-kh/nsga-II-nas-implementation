@@ -1,0 +1,36 @@
+paths:
+  pickle: data/HW-NAS-Bench-v1_0.pickle
+  nb201: null
+
+search:
+  search_space: fbnet
+  device: edgegpu
+  dataset: cifar10
+  algorithms:
+    - NSGA-NET-VNS
+
+runner:
+  runs: 5
+  population_size: 32
+  max_iterations: 80
+  seed: 42
+  quiet: false
+
+fitness:
+  latency_weight: 0.6
+  energy_weight: 0.4
+  accuracy_weight: 0.0
+
+output:
+  directory: ./outputs
+  run_name: nsga_net_vns_fbnet
+
+extra_kwargs:
+  NSGA-NET-VNS:
+    crossover_prob: 0.9
+    mutation_prob: 0.12
+    mutation_rate_dim: 0.25
+    vns_elite_fraction: 0.25
+    vns_k_max: 3
+    vns_trials_per_k: 2
+    archive_max_size: 256
