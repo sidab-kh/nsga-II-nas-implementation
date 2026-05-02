@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -58,6 +59,7 @@ class _NicheConstrainedNSGA2(NSGANetVNS):
         fitness_function: HardwareAwareFitness,
         *,
         niche: NicheDefinition,
+        niche_pool: np.ndarray,
         max_resample_attempts: int = 5000,
         **kwargs,
     ) -> None:
@@ -77,6 +79,15 @@ class _NicheConstrainedNSGA2(NSGANetVNS):
 
         self.niche = niche
         self.max_resample_attempts = max(10, int(max_resample_attempts))
+        self.niche_pool = np.asarray(niche_pool, dtype=int).reshape(-1)
+        if len(self.niche_pool) == 0:
+            raise ValueError(
+                f"Empty niche_pool for niche_id={self.niche.niche_id}. "
+                "This indicates a broken niche cache or niche definition."
+            )
+        # Fast membership test (used only for safety checks / fallbacks).
+        self._niche_pool_set = set(int(x) for x in self.niche_pool.tolist())
+        # Legacy cache kept for compatibility / debugging; no longer needed in hot paths.
         self._conv_cache: Dict[int, Tuple[int, int]] = {}
 
     def _conv_counts_for_idx(self, arch_idx: int) -> Tuple[int, int]:
@@ -95,31 +106,29 @@ class _NicheConstrainedNSGA2(NSGANetVNS):
         return counts
 
     def _in_niche(self, row: np.ndarray) -> bool:
-        arch = self._row_to_architecture(row)
-        if arch.arch_idx is None:
+        # NB201 dim=1 => the architecture identity is the integer index itself.
+        try:
+            idx = int(row[0])
+        except Exception:
             return False
-        conv3, conv1 = self._conv_counts_for_idx(arch.arch_idx)
-        return self.niche.contains(conv3x3=conv3, conv1x1=conv1)
+        return idx in self._niche_pool_set
 
     def _sample_row_in_niche(self, *, avoid: Optional[set[int]] = None) -> np.ndarray:
         avoid = avoid or set()
-        for _ in range(self.max_resample_attempts):
-            row = self._rng.integers(0, self.search_space_size, size=(self.dim,))
-            row = self._clip_row(row)
-            if not self._in_niche(row):
-                continue
-            idx = int(row[0])
+
+        # If the avoid set covers the whole niche, allow repeats.
+        if len(avoid) >= len(self.niche_pool):
+            avoid = set()
+
+        attempts = min(self.max_resample_attempts, 256)
+        for _ in range(attempts):
+            idx = int(self._rng.choice(self.niche_pool))
             if idx in avoid:
                 continue
-            return row
-        # Fallback: give up on novelty, but still enforce niche.
-        for _ in range(self.max_resample_attempts):
-            row = self._rng.integers(0, self.search_space_size, size=(self.dim,))
-            row = self._clip_row(row)
-            if self._in_niche(row):
-                return row
-        # As a last resort, return a random row.
-        return self._clip_row(self._rng.integers(0, self.search_space_size, size=(self.dim,)))
+            return np.array([idx], dtype=int)
+
+        # Fallback: return any niche member.
+        return np.array([int(self._rng.choice(self.niche_pool))], dtype=int)
 
     def _initialize_population(self) -> np.ndarray:
         population = np.empty((self.population_size, self.dim), dtype=int)
@@ -144,19 +153,19 @@ class _NicheConstrainedNSGA2(NSGANetVNS):
         if self._rng.random() >= self.mutation_prob:
             return child
 
-        # For NB201 (dim=1), keep mutating until we land in the niche.
-        original = int(child[0])
-        for _ in range(self.max_resample_attempts):
-            step = int(self._rng.integers(-strength, strength + 1))
-            if step == 0:
-                step = 1
-            candidate = child.copy()
-            candidate[0] = self._clip(original + step)
-            if self._in_niche(candidate):
-                return candidate
+        # Mutation is restricted to the niche by sampling directly from the
+        # precomputed niche pool.
+        if len(self.niche_pool) <= 1:
+            return child
 
-        # Fallback: global resample in the niche.
-        return self._sample_row_in_niche()
+        current = int(child[0])
+        for _ in range(8):
+            idx = int(self._rng.choice(self.niche_pool))
+            if idx != current:
+                out = child.copy()
+                out[0] = idx
+                return out
+        return child
 
 
 class NSGA2Partitioned(MetaheuristicOptimizer):
@@ -180,6 +189,8 @@ class NSGA2Partitioned(MetaheuristicOptimizer):
         fitness_function: HardwareAwareFitness,
         *,
         population_per_niche: Optional[int] = None,
+        niche_cache_path: str | Path | None = None,
+        rebuild_niche_cache: bool = False,
         max_resample_attempts: int = 5000,
         # NSGA-II parameters (forwarded to each niche optimizer)
         crossover_prob: float = 0.9,
@@ -200,6 +211,10 @@ class NSGA2Partitioned(MetaheuristicOptimizer):
             raise NotImplementedError("NSGA2Partitioned currently requires dim=1.")
 
         self.population_per_niche = population_per_niche
+        self.niche_cache_path = (
+            Path(niche_cache_path) if niche_cache_path is not None else None
+        )
+        self.rebuild_niche_cache = bool(rebuild_niche_cache)
         self.max_resample_attempts = max(10, int(max_resample_attempts))
         self.crossover_prob = float(crossover_prob)
         self.mutation_prob = float(mutation_prob)
@@ -212,6 +227,83 @@ class NSGA2Partitioned(MetaheuristicOptimizer):
         self.archive_population = np.empty((0, self.dim), dtype=int)
         self.archive_objectives = np.empty((0, 3), dtype=float)
         self.pareto_history: List[int] = []
+
+        self._niche_pools: Optional[List[np.ndarray]] = None
+
+    @staticmethod
+    def _default_niche_cache_path() -> Path:
+        # nsga-II-nas-implementation/algorithms/implementations/nsga2_partitioned.py
+        # -> project root is parents[2]
+        project_root = Path(__file__).resolve().parents[2]
+        cache_dir = project_root / "data" / "niche_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Dataset-agnostic: NB201 arch_str (and thus niches) are independent of the dataset.
+        return cache_dir / "nb201_niche_pools_v1.npz"
+
+    def _load_or_build_niche_pools(self) -> List[np.ndarray]:
+        if self._niche_pools is not None:
+            return self._niche_pools
+
+        dataset = str(self.fitness_function.dataset)
+        cache_path = self.niche_cache_path or self._default_niche_cache_path()
+
+        if cache_path.exists() and not self.rebuild_niche_cache:
+            try:
+                data = np.load(cache_path, allow_pickle=False)
+                if int(data["search_space_size"].item()) != int(self.search_space_size):
+                    raise ValueError("Cache search_space_size mismatch")
+                pools = [
+                    np.asarray(data[f"pool_{i}"], dtype=int).reshape(-1)
+                    for i in range(6)
+                ]
+                if any(len(p) == 0 for p in pools):
+                    raise ValueError("Cache contains empty niche pool")
+                self._niche_pools = pools
+                return pools
+            except Exception:
+                # If cache is corrupted or incompatible, rebuild it.
+                pass
+
+        # Build niche pools from the benchmark configs.
+        pools_list: List[List[int]] = [[] for _ in range(6)]
+        for arch_idx in range(int(self.search_space_size)):
+            cfg = self.fitness_function.api.get_net_config(arch_idx, dataset)
+            arch_str = cfg.get("arch_str") if isinstance(cfg, dict) else None
+            if not isinstance(arch_str, str):
+                conv3, conv1 = 0, 0
+            else:
+                conv3, conv1 = _count_nb201_convs_from_arch_str(arch_str)
+
+            assigned = False
+            for niche in self.niches:
+                if niche.contains(conv3x3=conv3, conv1x1=conv1):
+                    pools_list[niche.niche_id].append(int(arch_idx))
+                    assigned = True
+                    break
+            if not assigned:
+                pools_list[0].append(int(arch_idx))
+
+        pools = [np.asarray(p, dtype=int) for p in pools_list]
+        if any(len(p) == 0 for p in pools):
+            raise RuntimeError(
+                "Failed to build niche pools: at least one niche is empty. "
+                "Check niche definitions and pickle config availability."
+            )
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            search_space_size=np.asarray(int(self.search_space_size), dtype=int),
+            pool_0=pools[0],
+            pool_1=pools[1],
+            pool_2=pools[2],
+            pool_3=pools[3],
+            pool_4=pools[4],
+            pool_5=pools[5],
+        )
+
+        self._niche_pools = pools
+        return pools
 
     def _update_population(self, iteration: int) -> None:
         # Unused: this optimizer overrides `optimize()` to coordinate 6 niches.
@@ -254,12 +346,15 @@ class NSGA2Partitioned(MetaheuristicOptimizer):
     def optimize(self) -> Tuple[np.ndarray, float, List[float]]:
         sizes = self._split_population_sizes()
 
+        niche_pools = self._load_or_build_niche_pools()
+
         niche_opts: List[_NicheConstrainedNSGA2] = []
         for niche_id, niche in enumerate(self.niches):
             niche_seed = int(self.seed + 1000 * niche_id)
             opt = _NicheConstrainedNSGA2(
                 self.fitness_function,
                 niche=niche,
+                niche_pool=niche_pools[niche_id],
                 max_resample_attempts=self.max_resample_attempts,
                 search_space_size=self.search_space_size,
                 dim=self.dim,
@@ -326,6 +421,7 @@ class NSGA2Partitioned(MetaheuristicOptimizer):
         # Phase 3: final aggregation
         self._merge_archives(niche_opts)
 
+        assert self.best_solution is not None
         return self.best_solution.copy(), float(self.best_fitness), list(self.fitness_history)
 
     def run(self, run_id: int = 0) -> RunResult:
