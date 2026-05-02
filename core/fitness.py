@@ -7,7 +7,7 @@ Hardware-aware and accuracy-aware fitness functions for HW-NAS-Bench.
 from __future__ import annotations
 
 import warnings
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -141,6 +141,128 @@ class NASBench201AccuracyAPI:
         return acc
 
 
+class _AccuracyAPI(Protocol):
+    @property
+    def available(self) -> bool: ...
+
+    def get_accuracy(self, arch_idx: int, dataset: str = "cifar10") -> float: ...
+
+
+class NASBench201PickleAccuracyAPI:
+    """Accuracy lookup from a precomputed pickle mapping.
+
+    Expected file format matches `data/nasbench201_full_mapping.pkl` as demonstrated
+    in `use_nasbench201_pickle.py`:
+
+    - top-level: dict[int, arch_info]
+    - arch_info['datasets'][dataset_key] contains:
+        - 'metrics' (may include 'accuracy')
+        - 'more_info' (may include 'valid-accuracy'/'test-accuracy'/'train-accuracy')
+    """
+
+    _UNAVAILABLE_MSG = (
+        "NAS-Bench-201 pickle mapping is unavailable. Provide "
+        "`data/nasbench201_full_mapping.pkl` to enable accuracy-aware fitness."
+    )
+
+    def __init__(self, mapping_path: str) -> None:
+        self._mapping_path = mapping_path
+        self._data: Optional[Dict[int, Any]] = None
+        self._cache: Dict[Tuple[int, str], float] = {}
+        self._available = False
+
+        try:
+            import pickle
+
+            with open(mapping_path, "rb") as f:
+                loaded = pickle.load(f)
+
+            if not isinstance(loaded, dict):
+                raise TypeError(
+                    f"Expected dict in mapping pickle, got {type(loaded).__name__}"
+                )
+
+            # Normalize keys to int where possible.
+            data: Dict[int, Any] = {}
+            for k, v in loaded.items():
+                try:
+                    ik = int(k)
+                except Exception:
+                    continue
+                data[ik] = v
+
+            self._data = data
+            self._available = len(data) > 0
+            if self._available:
+                print("NAS-Bench-201 pickle mapping loaded")
+        except FileNotFoundError:
+            warnings.warn(self._UNAVAILABLE_MSG, UserWarning, stacklevel=3)
+        except Exception as exc:
+            warnings.warn(
+                f"NAS-Bench-201 pickle mapping failed to load ({exc}). Accuracy disabled.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    @staticmethod
+    def _extract_accuracy(dataset_info: Dict[str, Any]) -> Optional[float]:
+        metrics = dataset_info.get("metrics", {})
+        if isinstance(metrics, dict) and "accuracy" in metrics:
+            try:
+                return float(metrics["accuracy"])
+            except Exception:
+                return None
+
+        more_info = dataset_info.get("more_info", {})
+        if isinstance(more_info, dict):
+            for key in ("valid-accuracy", "test-accuracy", "train-accuracy"):
+                if key in more_info:
+                    try:
+                        return float(more_info[key])
+                    except Exception:
+                        return None
+
+        return None
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def get_accuracy(self, arch_idx: int, dataset: str = "cifar10") -> float:
+        if not self._available or self._data is None:
+            return 0.0
+
+        key = (int(arch_idx), dataset)
+        if key in self._cache:
+            return self._cache[key]
+
+        arch = self._data.get(int(arch_idx))
+        if not isinstance(arch, dict):
+            self._cache[key] = 0.0
+            return 0.0
+
+        datasets = arch.get("datasets", {})
+        if not isinstance(datasets, dict):
+            self._cache[key] = 0.0
+            return 0.0
+
+        # Prefer the same dataset mapping as the official API wrapper.
+        nb201_ds = _NB201_DATASET_MAP.get(dataset, dataset)
+
+        # Try mapped key, then original key.
+        dataset_info = datasets.get(nb201_ds) or datasets.get(dataset)
+        if not isinstance(dataset_info, dict):
+            self._cache[key] = 0.0
+            return 0.0
+
+        acc = self._extract_accuracy(dataset_info)
+        if acc is None:
+            acc = 0.0
+
+        self._cache[key] = float(acc)
+        return float(acc)
+
+
 class HardwareAwareFitness:
     """Joint hardware and optional accuracy fitness."""
 
@@ -149,6 +271,7 @@ class HardwareAwareFitness:
         api: HWNASBenchAPI,
         *,
         nb201_path: Optional[str] = None,
+        nb201_mapping_path: Optional[str] = None,
         target_device: str = "edgegpu",
         dataset: str = "cifar10",
         latency_weight: float = 0.5,
@@ -168,7 +291,7 @@ class HardwareAwareFitness:
         self.dataset = dataset
         self.search_space = api.search_space
 
-        self._acc_api: Optional[NASBench201AccuracyAPI] = None
+        self._acc_api: Optional[_AccuracyAPI] = None
         self._acc_available = False
 
         if self.search_space == SearchSpace.FBNET and accuracy_weight > 0:
@@ -179,13 +302,13 @@ class HardwareAwareFitness:
             )
             accuracy_weight = 0.0
 
-        if (
-            self.search_space == SearchSpace.NASBENCH201
-            and nb201_path is not None
-            and accuracy_weight > 0
-        ):
-            self._acc_api = NASBench201AccuracyAPI(nb201_path, hp=nb201_hp)
-            self._acc_available = self._acc_api.available
+        if self.search_space == SearchSpace.NASBENCH201 and accuracy_weight > 0:
+            if nb201_mapping_path is not None:
+                self._acc_api = NASBench201PickleAccuracyAPI(nb201_mapping_path)
+                self._acc_available = self._acc_api.available
+            elif nb201_path is not None:
+                self._acc_api = NASBench201AccuracyAPI(nb201_path, hp=nb201_hp)
+                self._acc_available = self._acc_api.available
 
         if not self._acc_available and accuracy_weight > 0:
             warnings.warn(

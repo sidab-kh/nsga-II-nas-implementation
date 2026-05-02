@@ -1,6 +1,6 @@
-data/
+data/*
+!data/nasbench201_full_mapping.pkl
 /outputs
 __pycache__/
 *.log
 .venv
-
